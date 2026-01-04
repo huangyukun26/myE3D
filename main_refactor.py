@@ -9,8 +9,7 @@ import shutil
 import time
 from datetime import datetime
 from pathlib import Path
-from functools import partial
-from typing import List, Tuple, Set
+from typing import List, Optional, Tuple, Set
 
 import cv2
 import numpy as np
@@ -29,7 +28,7 @@ from objloader import Obj
 
 from Configs import MainConfig, ProjectionConfig, CameraAngle
 from FLUX.flux_refine_depth_exp_pipe import initialize_flux_pipeline, run_flux_pipeline
-from Mono.Marigold import setup_mari_pipeline, flip_red_channel
+from normal_predictors import MarigoldPredictor, MockPredictor
 from Projection import HeadlessProjectionMapping, HeadlessBaker
 from Utils.sam import remove_bg, sam_init
 from Utils.etc import (
@@ -71,7 +70,16 @@ class MeshRefinementPipeline:
     - Optional schedules and steps as in the original script.
     """
 
-    def __init__(self, obj_name: str, conf_name: str, device_idx: int, render_video: bool, bake_mesh: bool, device: str = "cuda"):
+    def __init__(
+        self,
+        obj_name: str,
+        conf_name: str,
+        device_idx: int,
+        render_video: bool,
+        bake_mesh: bool,
+        normal_predictor: Optional[str] = None,
+        device: str = "cuda",
+    ):
         """                                           
         Initialize the pipeline with given object name, config name, and device.
 
@@ -85,10 +93,11 @@ class MeshRefinementPipeline:
         self.bake_mesh    = bake_mesh
         self.device       = device
         self.device_idx   = device_idx
+        self.normal_predictor_choice = normal_predictor
 
         # Will be set once the config is loaded in `run()`.
         self.cfg = None
-        self.mari_pipe = None
+        self.normal_predictor = None
         self.flux_pipe = None
         self.sam_predictor = None
 
@@ -124,6 +133,7 @@ class MeshRefinementPipeline:
         # Ref cond for grid
         self.np_image = None
         self.np_control = None
+        self.latest_coarse_normal = None
 
     @staticmethod
     def load_config(*yaml_files, cli_args=[]):
@@ -133,28 +143,23 @@ class MeshRefinementPipeline:
         OmegaConf.resolve(conf)
         return conf
 
-    def prepare_mari_pipe(self):
-        """Initialize the Marigold (Mono) pipeline with the config and device."""
-        mari_pipe = setup_mari_pipeline(self.cfg.mono)
-        mari_pipe = mari_pipe.to(self.device)
-        mari_pipe.unet.eval()
+    def prepare_normal_predictor(self):
+        """Initialize the normal predictor with fallback to a mock implementation."""
+        predictor_choice = self.cfg.normal_predictor
+        if predictor_choice is not None:
+            predictor_choice = predictor_choice.lower()
 
-        mari_base_pipe = partial(
-            mari_pipe,
-            denoising_steps=self.cfg.mono.denoise_steps,
-            ensemble_size=self.cfg.mono.ensemble_size,
-            processing_res=self.cfg.mono.processing_res,
-            match_input_res=True,
-            batch_size=self.cfg.mono.batch_size,
-            color_map=self.cfg.mono.color_map,
-            show_progress_bar=False,  # Disable internal progress bar
-            resample_method=self.cfg.mono.resample_method,
-            # Additional parameters
-            normals=(self.cfg.mono.modality == "normals"),
-            noise=self.cfg.mono.noise,
-        )
+        if predictor_choice == "auto":
+            predictor_choice = None
 
-        return mari_base_pipe
+        if predictor_choice == "mock":
+            return MockPredictor(coarse_normal_provider=lambda: self.latest_coarse_normal)
+
+        try:
+            return MarigoldPredictor(self.cfg, self.device)
+        except Exception as exc:
+            print(f"WARN: Failed to initialize MarigoldPredictor ({exc}). Falling back to MockPredictor.")
+            return MockPredictor(coarse_normal_provider=lambda: self.latest_coarse_normal)
 
     @staticmethod
     def render_planar_projection(
@@ -361,6 +366,7 @@ class MeshRefinementPipeline:
             thresh=self.cfg.cos_thresh,
             device_idx=self.device_idx,
         )
+        self.latest_coarse_normal = target_renders.get("normal")
 
         # 1-1) Render target view & compute ratio
         if self.is_init:
@@ -495,11 +501,10 @@ class MeshRefinementPipeline:
 
         # 6) Normal Prediction (Marigold)
         with torch.no_grad():
-            mari_pipe_out = self.mari_pipe(next_rgb.convert("RGB"))
-            mari_normal_colored = mari_pipe_out.normal_colored
-
             normal_path = self.remeshing_dir / "normals" / f"normals_{postfix}.png"
-            mari_normal_colored.save(normal_path)
+            normal_img, extra = self.normal_predictor(next_rgb.convert("RGB"))
+            _ = extra
+            normal_img.save(normal_path)
             print(f"Saved normal map to {normal_path}")
 
         flush()
@@ -661,9 +666,11 @@ class MeshRefinementPipeline:
         schema = OmegaConf.structured(MainConfig)
         self.cfg = OmegaConf.merge(schema, cfg)
         self.cfg.obj_name = self.obj_name
+        if self.normal_predictor_choice is not None:
+            self.cfg.normal_predictor = self.normal_predictor_choice
 
         # 2) Initialize pipelines
-        self.mari_pipe = self.prepare_mari_pipe()
+        self.normal_predictor = self.prepare_normal_predictor()
         self.flux_pipe = initialize_flux_pipeline(self.cfg, self.device)
         self.sam_predictor = sam_init(self.cfg.sam_ckpt_path)
 
@@ -889,6 +896,13 @@ if __name__ == "__main__":
     parser.add_argument('--device_idx', type=int, required=True, help='Bake into textured mesh at the end?')
     parser.add_argument('--render_video', action='store_true', help='Render video at the end?')
     parser.add_argument('--bake_mesh', action='store_true', help='Bake into textured mesh at the end?')
+    parser.add_argument(
+        '--normal_predictor',
+        type=str,
+        choices=['auto', 'marigold', 'mock'],
+        default='auto',
+        help='Normal predictor selection.',
+    )
     args = parser.parse_args()
 
     pipeline = MeshRefinementPipeline(
@@ -897,6 +911,6 @@ if __name__ == "__main__":
             device_idx=args.device_idx,
             render_video=args.render_video,
             bake_mesh=args.bake_mesh,
+            normal_predictor=args.normal_predictor,
             )
     pipeline.run()
-
