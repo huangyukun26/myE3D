@@ -35,6 +35,7 @@ class BaseConfig:
 
     ablation_tex: bool = False
     ablation_geo: bool = False
+    normal_predictor: Optional[str] = None
 
 @dataclass
 class FluxPipelineParameters:
