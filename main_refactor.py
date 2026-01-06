@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
@@ -7,10 +8,10 @@ import subprocess
 import re
 import shutil
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from functools import partial
-from typing import List, Tuple, Set
+from typing import List, Optional, Tuple, Set
 
 import cv2
 import numpy as np
@@ -29,7 +30,7 @@ from objloader import Obj
 
 from Configs import MainConfig, ProjectionConfig, CameraAngle
 from FLUX.flux_refine_depth_exp_pipe import initialize_flux_pipeline, run_flux_pipeline
-from Mono.Marigold import setup_mari_pipeline, flip_red_channel
+from normal_predictors import MarigoldPredictor, MockPredictor
 from Projection import HeadlessProjectionMapping, HeadlessBaker
 from Utils.sam import remove_bg, sam_init
 from Utils.etc import (
@@ -71,7 +72,18 @@ class MeshRefinementPipeline:
     - Optional schedules and steps as in the original script.
     """
 
-    def __init__(self, obj_name: str, conf_name: str, device_idx: int, render_video: bool, bake_mesh: bool, device: str = "cuda"):
+    def __init__(
+        self,
+        obj_name: str,
+        conf_name: str,
+        device_idx: int,
+        render_video: bool,
+        bake_mesh: bool,
+        normal_predictor: Optional[str] = None,
+        view_manifest: Optional[str] = None,
+        view_mode: Optional[str] = None,
+        device: str = "cuda",
+    ):
         """                                           
         Initialize the pipeline with given object name, config name, and device.
 
@@ -85,10 +97,13 @@ class MeshRefinementPipeline:
         self.bake_mesh    = bake_mesh
         self.device       = device
         self.device_idx   = device_idx
+        self.normal_predictor_choice = normal_predictor
+        self.view_manifest = view_manifest
+        self.view_mode = view_mode
 
         # Will be set once the config is loaded in `run()`.
         self.cfg = None
-        self.mari_pipe = None
+        self.normal_predictor = None
         self.flux_pipe = None
         self.sam_predictor = None
 
@@ -119,11 +134,19 @@ class MeshRefinementPipeline:
 
         # Track initialization stage, angles seen, etc.
         self.is_init = True
-        self.seen_angle_list: List[CameraAngle] = []
+        self.seen_angle_list: List["MeshRefinementPipeline.ViewInfo"] = []
 
         # Ref cond for grid
         self.np_image = None
         self.np_control = None
+        self.latest_coarse_normal = None
+
+    @dataclass(frozen=True)
+    class ViewInfo:
+        """View descriptor for refinement input selection."""
+        yaw: float
+        pitch: float
+        image_path: Optional[Path] = None
 
     @staticmethod
     def load_config(*yaml_files, cli_args=[]):
@@ -133,28 +156,72 @@ class MeshRefinementPipeline:
         OmegaConf.resolve(conf)
         return conf
 
-    def prepare_mari_pipe(self):
-        """Initialize the Marigold (Mono) pipeline with the config and device."""
-        mari_pipe = setup_mari_pipeline(self.cfg.mono)
-        mari_pipe = mari_pipe.to(self.device)
-        mari_pipe.unet.eval()
+    def prepare_normal_predictor(self):
+        """Initialize the normal predictor with fallback to a mock implementation."""
+        predictor_choice = self.cfg.normal_predictor
+        if predictor_choice is not None:
+            predictor_choice = predictor_choice.lower()
 
-        mari_base_pipe = partial(
-            mari_pipe,
-            denoising_steps=self.cfg.mono.denoise_steps,
-            ensemble_size=self.cfg.mono.ensemble_size,
-            processing_res=self.cfg.mono.processing_res,
-            match_input_res=True,
-            batch_size=self.cfg.mono.batch_size,
-            color_map=self.cfg.mono.color_map,
-            show_progress_bar=False,  # Disable internal progress bar
-            resample_method=self.cfg.mono.resample_method,
-            # Additional parameters
-            normals=(self.cfg.mono.modality == "normals"),
-            noise=self.cfg.mono.noise,
-        )
+        if predictor_choice == "auto":
+            predictor_choice = None
 
-        return mari_base_pipe
+        if predictor_choice == "mock":
+            return MockPredictor(coarse_normal_provider=lambda: self.latest_coarse_normal)
+
+        try:
+            return MarigoldPredictor(self.cfg, self.device)
+        except Exception as exc:
+            print(f"WARN: Failed to initialize MarigoldPredictor ({exc}). Falling back to MockPredictor.")
+            return MockPredictor(coarse_normal_provider=lambda: self.latest_coarse_normal)
+
+    def load_view_manifest(self, manifest_path: Path) -> List["MeshRefinementPipeline.ViewInfo"]:
+        """Load view metadata from a preprocess manifest with validation."""
+        if not manifest_path.exists():
+            raise FileNotFoundError(f"View manifest not found: {manifest_path}")
+
+        manifest = json.loads(manifest_path.read_text())
+        required_top = {"object_name", "normalized_obj_path", "axis_forward", "axis_up", "views"}
+        missing_top = required_top - manifest.keys()
+        if missing_top:
+            raise ValueError(f"View manifest missing required fields: {sorted(missing_top)}")
+
+        views = manifest.get("views")
+        if not isinstance(views, list):
+            raise ValueError("View manifest 'views' must be a list.")
+
+        required_view = {
+            "image_path",
+            "azimuth_deg",
+            "elevation_deg",
+            "camera_location",
+            "radius",
+            "camera_type",
+            "ortho_scale",
+            "resolution",
+            "track_axis",
+            "up_axis",
+        }
+        view_infos: List[MeshRefinementPipeline.ViewInfo] = []
+        for idx, view in enumerate(views):
+            missing_view = required_view - view.keys()
+            if missing_view:
+                raise ValueError(f"View manifest entry {idx} missing fields: {sorted(missing_view)}")
+
+            image_path = Path(view["image_path"])
+            if not image_path.is_absolute():
+                image_path = manifest_path.parent / image_path
+            if not image_path.exists():
+                raise FileNotFoundError(f"View image not found: {image_path}")
+
+            view_infos.append(
+                MeshRefinementPipeline.ViewInfo(
+                    yaw=float(view["azimuth_deg"]),
+                    pitch=float(view["elevation_deg"]),
+                    image_path=image_path,
+                )
+            )
+
+        return view_infos
 
     @staticmethod
     def render_planar_projection(
@@ -329,7 +396,12 @@ class MeshRefinementPipeline:
         print(f"Inpaint mask ratio: {ratio:.4f}, Refinement type: {refine_type.name}")
         return ratio, refine_type
 
-    def process_angle(self, angle: CameraAngle, next_or_prev_angle: CameraAngle, is_main_schedule=False):
+    def process_angle(
+        self,
+        angle: "MeshRefinementPipeline.ViewInfo",
+        next_or_prev_angle: "MeshRefinementPipeline.ViewInfo",
+        is_main_schedule=False,
+    ):
         """
         Perform the entire pipeline for a single angle (pitch, yaw).
         This method does NOT take the member variables as arguments;
@@ -338,6 +410,8 @@ class MeshRefinementPipeline:
         process_angle_start = time.perf_counter()
         yaw = angle.yaw
         pitch = angle.pitch
+        if angle.image_path:
+            print(f"Using view image path: {angle.image_path}")
 
         np_yaw   = next_or_prev_angle.yaw
         np_pitch = next_or_prev_angle.pitch
@@ -361,6 +435,7 @@ class MeshRefinementPipeline:
             thresh=self.cfg.cos_thresh,
             device_idx=self.device_idx,
         )
+        self.latest_coarse_normal = target_renders.get("normal")
 
         # 1-1) Render target view & compute ratio
         if self.is_init:
@@ -495,11 +570,10 @@ class MeshRefinementPipeline:
 
         # 6) Normal Prediction (Marigold)
         with torch.no_grad():
-            mari_pipe_out = self.mari_pipe(next_rgb.convert("RGB"))
-            mari_normal_colored = mari_pipe_out.normal_colored
-
             normal_path = self.remeshing_dir / "normals" / f"normals_{postfix}.png"
-            mari_normal_colored.save(normal_path)
+            normal_img, extra = self.normal_predictor(next_rgb.convert("RGB"))
+            _ = extra
+            normal_img.save(normal_path)
             print(f"Saved normal map to {normal_path}")
 
         flush()
@@ -661,9 +735,15 @@ class MeshRefinementPipeline:
         schema = OmegaConf.structured(MainConfig)
         self.cfg = OmegaConf.merge(schema, cfg)
         self.cfg.obj_name = self.obj_name
+        if self.normal_predictor_choice is not None:
+            self.cfg.normal_predictor = self.normal_predictor_choice
+        if self.view_manifest is not None:
+            self.cfg.view_manifest = self.view_manifest
+        if self.view_mode is not None:
+            self.cfg.view_mode = self.view_mode
 
         # 2) Initialize pipelines
-        self.mari_pipe = self.prepare_mari_pipe()
+        self.normal_predictor = self.prepare_normal_predictor()
         self.flux_pipe = initialize_flux_pipeline(self.cfg, self.device)
         self.sam_predictor = sam_init(self.cfg.sam_ckpt_path)
 
@@ -720,12 +800,37 @@ class MeshRefinementPipeline:
         self.obj_mesh = Obj.open(self.coarse_obj_path)
 
         # 5) Process camera schedules
-        camera_schedule = self.cfg.camera_schedule
-        if not camera_schedule:
-            raise ValueError("Camera schedule is empty. Please define camera angles in the configuration.")
+        view_mode = (self.cfg.view_mode or "auto").lower()
+        view_manifest_path = Path(self.cfg.view_manifest) if self.cfg.view_manifest else None
+        if view_mode not in {"auto", "manifest", "procedural"}:
+            raise ValueError(f"Unsupported view_mode: {view_mode}")
+
+        use_manifest = False
+        if view_mode == "manifest":
+            if view_manifest_path is None:
+                raise ValueError("view_mode is 'manifest' but no view_manifest is provided.")
+            use_manifest = True
+        elif view_mode == "auto":
+            use_manifest = view_manifest_path is not None
+        elif view_mode == "procedural" and view_manifest_path is not None:
+            print("WARN: view_mode is 'procedural'; ignoring provided view_manifest.")
+
+        if use_manifest:
+            view_infos = self.load_view_manifest(view_manifest_path)
+            if not view_infos:
+                raise ValueError("View manifest is empty.")
+            print(f"Using manifest views: {len(view_infos)} views from {view_manifest_path}")
+        else:
+            camera_schedule = self.cfg.camera_schedule
+            if not camera_schedule:
+                raise ValueError("Camera schedule is empty. Please define camera angles in the configuration.")
+            view_infos = [
+                MeshRefinementPipeline.ViewInfo(yaw=entry["yaw"], pitch=entry["pitch"])
+                for entry in camera_schedule
+            ]
 
         # Build a set of angles from the main schedule
-        camera_angles = set((entry['yaw'] % 360, entry['pitch']) for entry in camera_schedule)
+        camera_angles = set((view.yaw % 360, view.pitch) for view in view_infos)
 
         # 4) Copy textures and OBJ
         copy_texture_files(self.exp_in_dir, self.texture_dir, len(camera_angles))
@@ -756,11 +861,12 @@ class MeshRefinementPipeline:
         print(f"Refinement preparation took {prepare_end - start_time:0.4f} seconds")
 
         # Main schedule angles
-        for i, angle_dict in enumerate(camera_schedule):
+        for i, angle in enumerate(view_infos):
             # WARN: This assumes main schedule will have at least 2 views
             if i == 0:
-                self.next_or_prev_angle = camera_schedule[i+1]
-            angle = CameraAngle(yaw=angle_dict["yaw"], pitch=angle_dict["pitch"])
+                if len(view_infos) < 2:
+                    raise ValueError("Main schedule must include at least 2 views.")
+                self.next_or_prev_angle = view_infos[i + 1]
             rename_existing_files(self.texture_dir, angle.yaw, angle.pitch)
             cur_refine_type = self.process_angle(angle, self.next_or_prev_angle, is_main_schedule=True)
             if cur_refine_type != RefineType.SKIP:
@@ -805,11 +911,18 @@ class MeshRefinementPipeline:
             # Rename & process
             rename_existing_files(self.texture_dir, max_angle.yaw, max_angle.pitch, refine_type)
             self.seen_angle_list.append(max_angle)
-            cur_refine_type = self.process_angle(max_angle, self.next_or_prev_angle, is_main_schedule=False)
+            cur_refine_type = self.process_angle(
+                MeshRefinementPipeline.ViewInfo(yaw=max_angle.yaw, pitch=max_angle.pitch),
+                self.next_or_prev_angle,
+                is_main_schedule=False,
+            )
 
             # Remove processed angle
             filtered_train_schedule.remove(max_angle)
-            self.next_or_prev_angle = max_angle
+            self.next_or_prev_angle = MeshRefinementPipeline.ViewInfo(
+                yaw=max_angle.yaw,
+                pitch=max_angle.pitch,
+            )
 
             del renderer
 
@@ -889,6 +1002,21 @@ if __name__ == "__main__":
     parser.add_argument('--device_idx', type=int, required=True, help='Bake into textured mesh at the end?')
     parser.add_argument('--render_video', action='store_true', help='Render video at the end?')
     parser.add_argument('--bake_mesh', action='store_true', help='Bake into textured mesh at the end?')
+    parser.add_argument(
+        '--normal_predictor',
+        type=str,
+        choices=['auto', 'marigold', 'mock'],
+        default='auto',
+        help='Normal predictor selection.',
+    )
+    parser.add_argument('--view_manifest', type=str, default=None, help='Path to view manifest JSON.')
+    parser.add_argument(
+        '--view_mode',
+        type=str,
+        choices=['auto', 'manifest', 'procedural'],
+        default='auto',
+        help='View selection mode.',
+    )
     args = parser.parse_args()
 
     pipeline = MeshRefinementPipeline(
@@ -897,6 +1025,8 @@ if __name__ == "__main__":
             device_idx=args.device_idx,
             render_video=args.render_video,
             bake_mesh=args.bake_mesh,
+            normal_predictor=args.normal_predictor,
+            view_manifest=args.view_manifest,
+            view_mode=args.view_mode,
             )
     pipeline.run()
-

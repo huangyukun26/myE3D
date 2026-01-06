@@ -6,6 +6,7 @@ It can render images with filenames that encode the camera's azimuth and elevati
 """
 
 import argparse
+import json
 import math
 import random
 import sys
@@ -385,8 +386,8 @@ def setup_render_settings(engine: str, resolution: int, samples: int) -> None:
 
 
 def execute_render_pass(
-    tasks: List[RenderTask], output_dir: Path, radius: float
-) -> None:
+    tasks: List[RenderTask], output_dir: Path, radius: float, resolution: int
+) -> List[Dict[str, Any]]:
     """
     Executes the orthographic rendering pass for a list of tasks.
 
@@ -396,12 +397,13 @@ def execute_render_pass(
         radius: The camera distance from the origin.
     """
     if not tasks:
-        return
+        return []
 
     print("\n--- Starting orthographic render pass ---")
 
     cam = setup_camera_and_track(Vector((0, 0, 0)))
     frame_mappings: Dict[int, Path] = {}
+    view_records: List[Dict[str, Any]] = []
     current_frame = 1
 
     # This loop will typically only run once, but handles the list structure.
@@ -429,10 +431,24 @@ def execute_render_pass(
             else:
                 filename = f"{prefix}_{i:03d}.png"
             frame_mappings[current_frame] = task_output_dir / filename
+            view_records.append(
+                {
+                    "image_path": str(task_output_dir / filename),
+                    "azimuth_deg": azimuth,
+                    "elevation_deg": elevation,
+                    "camera_location": [location.x, location.y, location.z],
+                    "radius": radius,
+                    "camera_type": "ORTHO",
+                    "ortho_scale": 1.0,
+                    "resolution": resolution,
+                    "track_axis": "NEGATIVE_Z",
+                    "up_axis": "Y",
+                }
+            )
             current_frame += 1
 
     if not frame_mappings:
-        return
+        return []
 
     _SCENE.frame_start = 1
     _SCENE.frame_end = current_frame - 1
@@ -452,6 +468,26 @@ def execute_render_pass(
     bpy.data.objects[cam.name].select_set(True)
     bpy.data.objects["TrackTarget"].select_set(True)
     bpy.ops.object.delete()
+    return view_records
+
+
+def write_views_manifest(
+    output_dir: Path,
+    view_records: List[Dict[str, Any]],
+    object_name: str,
+    normalized_obj_path: Optional[Path],
+) -> None:
+    """Write a sidecar JSON manifest describing each rendered view."""
+    manifest_path = output_dir / "views_manifest.json"
+    manifest = {
+        "object_name": object_name,
+        "normalized_obj_path": str(normalized_obj_path) if normalized_obj_path else "",
+        "axis_forward": "Z",
+        "axis_up": "Y",
+        "views": view_records,
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+    print(f"Saved views manifest to {manifest_path}")
 
 
 def main():
@@ -500,12 +536,13 @@ def main():
     if args.num_renders > 0:
         tasks.append(RenderTask(args.num_renders, args.random_camera))
 
-    execute_render_pass(tasks, args.output_dir, args.radius)
+    view_records = execute_render_pass(tasks, args.output_dir, args.radius, args.resolution)
 
     bpy.ops.object.select_all(action="DESELECT")
     for obj in _SCENE.objects:
         if obj.type == "MESH":
             obj.select_set(True)
+    normalized_path = None
     if _CONTEXT.selected_objects and args.num_renders > 0:
         obj_name = args.object_path.stem
         normalized_path = args.output_dir / f"{obj_name}_normalized.obj"
@@ -517,6 +554,8 @@ def main():
             axis_up='Y'
         )
         print(f"\nSaved final normalized model to {normalized_path}")
+        if view_records:
+            write_views_manifest(args.output_dir, view_records, obj_name, normalized_path)
     print("Rendering complete.")
 
 if __name__ == "__main__":
