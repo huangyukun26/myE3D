@@ -125,6 +125,7 @@ class MeshRefinementPipeline:
         self.normal_dir: Path = None
         self.mask_dir: Path = None
         self.video_frame_dir: Path = None
+        self.view_obs_dir: Path = None
 
         # These will be set once the mesh is loaded
         self.obj_mesh = None
@@ -147,6 +148,15 @@ class MeshRefinementPipeline:
         yaw: float
         pitch: float
         image_path: Optional[Path] = None
+        camera_location: Optional[List[float]] = None
+        radius: Optional[float] = None
+        ortho_scale: Optional[float] = None
+        resolution: Optional[int] = None
+        camera_type: Optional[str] = None
+        track_axis: Optional[str] = None
+        up_axis: Optional[str] = None
+        axis_forward: Optional[str] = None
+        axis_up: Optional[str] = None
 
     @staticmethod
     def load_config(*yaml_files, cli_args=[]):
@@ -218,6 +228,15 @@ class MeshRefinementPipeline:
                     yaw=float(view["azimuth_deg"]),
                     pitch=float(view["elevation_deg"]),
                     image_path=image_path,
+                    camera_location=list(view["camera_location"]),
+                    radius=float(view["radius"]),
+                    ortho_scale=float(view["ortho_scale"]),
+                    resolution=int(view["resolution"]),
+                    camera_type=str(view["camera_type"]),
+                    track_axis=str(view["track_axis"]),
+                    up_axis=str(view["up_axis"]),
+                    axis_forward=str(manifest["axis_forward"]),
+                    axis_up=str(manifest["axis_up"]),
                 )
             )
 
@@ -339,6 +358,57 @@ class MeshRefinementPipeline:
         del renderer
 
         return zoom, postfix, refine_type, ratio, inpaint_mask, rendered_images
+
+    def save_view_observation(
+        self,
+        postfix: str,
+        yaw: float,
+        pitch: float,
+        depth_map: np.ndarray,
+        depth_mask: np.ndarray,
+        mv_mat,
+        image_path: Optional[Path] = None,
+        camera_location: Optional[List[float]] = None,
+        radius: Optional[float] = None,
+        ortho_scale: Optional[float] = None,
+        resolution: Optional[int] = None,
+        axis_forward: Optional[str] = None,
+        axis_up: Optional[str] = None,
+        normal_path: Optional[Path] = None,
+        mask_path: Optional[Path] = None,
+    ) -> None:
+        """Persist per-view geometry observations for MVCC."""
+        view_obs_dir = self.view_obs_dir or (self.exp_out_dir / "view_obs")
+        view_obs_dir.mkdir(parents=True, exist_ok=True)
+
+        depth_path = view_obs_dir / f"depth_{postfix}.npy"
+        depth_mask_path = view_obs_dir / f"depthmask_{postfix}.npy"
+        np.save(depth_path, depth_map.astype(np.float32))
+        np.save(depth_mask_path, depth_mask.astype(np.uint8))
+
+        meta = {
+            "postfix": postfix,
+            "yaw": float(yaw),
+            "pitch": float(pitch),
+            "image_path": str(image_path) if image_path else None,
+            "camera_type": "ORTHO",
+            "ortho_scale": ortho_scale if ortho_scale is not None else 1.0,
+            "resolution": resolution if resolution is not None else self.cfg.im_res,
+            "camera_location": camera_location,
+            "radius": radius,
+            "axis_forward": axis_forward if axis_forward is not None else "Z",
+            "axis_up": axis_up if axis_up is not None else "Y",
+            "mv_mat": mv_mat.tolist() if hasattr(mv_mat, "tolist") else mv_mat,
+            "timestamp": datetime.now().isoformat(),
+        }
+        if normal_path is not None:
+            meta["normal_path"] = str(normal_path)
+        if mask_path is not None:
+            meta["mask_path"] = str(mask_path)
+
+        meta_path = view_obs_dir / f"meta_{postfix}.json"
+        meta_path.write_text(json.dumps(meta, indent=2))
+        print(f"Saved view_obs: {depth_path.name}, {meta_path.name}")
 
     @staticmethod
     def compute_refinement_ratio(cfg, renderer, pitch, yaw, res=1024, thresh=0.7):
@@ -601,6 +671,24 @@ class MeshRefinementPipeline:
         step5_end = time.perf_counter()
         print(f"[Process Angle] Depth prior rendering took {step5_end - step4_end:0.4f} seconds")
 
+        self.save_view_observation(
+            postfix=postfix,
+            yaw=yaw,
+            pitch=pitch,
+            depth_map=depth_map,
+            depth_mask=depth_mask,
+            mv_mat=mv_mat,
+            image_path=angle.image_path,
+            camera_location=angle.camera_location,
+            radius=angle.radius,
+            ortho_scale=angle.ortho_scale,
+            resolution=angle.resolution,
+            axis_forward=angle.axis_forward,
+            axis_up=angle.axis_up,
+            normal_path=self.remeshing_dir / "normals" / f"normals_{postfix}.png",
+            mask_path=self.remeshing_dir / "masks" / f"mask_{postfix}.png",
+        )
+
         # 8-1) Prepare normal maps
 
         blended_normal_map = load_and_blend_maps(base_map_path=output_dir / f"normal_{postfix}.png",
@@ -768,6 +856,7 @@ class MeshRefinementPipeline:
         self.normal_dir = self.remeshing_dir / "normals"
         self.mask_dir = self.remeshing_dir / "masks"
         self.video_frame_dir = self.video_dir / "frames"
+        self.view_obs_dir = self.exp_out_dir / "view_obs"
 
         # Create directories
         for directory in [
@@ -786,6 +875,7 @@ class MeshRefinementPipeline:
             self.partial_meshes_dir,
             self.bini_save_dir,
             self.video_frame_dir,
+            self.view_obs_dir,
         ]:
             directory.mkdir(parents=True, exist_ok=True)
             print(f"Ensured directory exists: {directory}")
